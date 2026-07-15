@@ -1,0 +1,149 @@
+name: Auto Release Note
+
+on:
+  schedule:
+    # 01:30 AM UTC on Monday = 08:30 AM Vietnam time (GMT+7)
+    - cron: '30 1 * * 1'
+  workflow_dispatch: # Allow manual trigger for testing
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ==========================================
+  # JOB 1: DETECT CODE CHANGES (Develop vs Main)
+  # ==========================================
+  check-changes:
+    name: Detect changes (Develop vs Main)
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git Diff Check
+        id: check
+        run: |
+          git fetch origin main develop
+          COMMITS_AHEAD=$(git rev-list --count origin/main..origin/develop)
+          if [ "$COMMITS_AHEAD" -eq 0 ]; then
+            echo "No new commits in develop relative to main. Skipping release."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits detected in develop that are not in main!"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ==========================================
+  # JOB 2: CREATE RELEASE BRANCH + PULL REQUEST
+  # ==========================================
+  create-release:
+    name: Create release branch & PR
+    needs: check-changes
+    if: needs.check-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      branch_name: ${{ steps.branch.outputs.branch_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---- Create release/yyyymmdd from develop ----
+      - name: Create and push release branch
+        id: branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main develop
+
+          DATE=$(date +'%Y%m%d')
+          BRANCH_NAME="release/$DATE"
+
+          # If a release branch for today already exists, refresh it with latest develop;
+          # otherwise create it from develop.
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "Branch $BRANCH_NAME already exists. Merging latest develop into it."
+            git checkout -B "$BRANCH_NAME" "origin/$BRANCH_NAME"
+            git merge origin/develop --no-edit
+          else
+            echo "Creating branch $BRANCH_NAME from develop."
+            git checkout -b "$BRANCH_NAME" origin/develop
+          fi
+          git push origin "$BRANCH_NAME"
+
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "release_date=$DATE" >> $GITHUB_OUTPUT
+
+      # ---- Aggregate merged PRs into develop since last release, then open PR ----
+      - name: Generate release notes and create PR
+        id: pr
+        run: |
+          BRANCH_NAME="${{ steps.branch.outputs.branch_name }}"
+          DATE="${{ steps.branch.outputs.release_date }}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          PR_TITLE="[$REPO_NAME] Release/$DATE"
+
+          # Detect whether an open PR already exists for this branch
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --base main --state open --json url --jq '.[0].url' 2>/dev/null || true)
+
+          # Collect PR numbers referenced in commits merged into develop since last release
+          PR_NUMBERS=$(git log origin/main..origin/develop --oneline \
+            | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)
+
+          {
+            echo "## Release Notes ($DATE)"
+            echo ""
+            echo "Pull requests merged into \`develop\` since the last release:"
+            echo ""
+          } > pr_body.txt
+
+          : > reviewers.txt
+          FOUND=0
+          for pr in $PR_NUMBERS; do
+            PR_JSON=$(gh pr view "$pr" --json title,author,url 2>/dev/null || true)
+            [ -z "$PR_JSON" ] && continue
+            TITLE=$(echo "$PR_JSON" | jq -r '.title')
+            AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
+            URL=$(echo "$PR_JSON" | jq -r '.url')
+            echo "- $TITLE by @$AUTHOR ($URL)" >> pr_body.txt
+            FOUND=1
+            case "$AUTHOR" in
+              github-actions\[bot\]|dependabot\[bot\]|"") ;;
+              *) echo "$AUTHOR" >> reviewers.txt ;;
+            esac
+          done
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "- (No linked pull requests found — see full commit diff)" >> pr_body.txt
+          fi
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Updating existing PR: $EXISTING_PR"
+            gh pr edit "$EXISTING_PR" --title "$PR_TITLE" --body-file pr_body.txt
+            PR_URL="$EXISTING_PR"
+          else
+            PR_URL=$(gh pr create \
+              --title "$PR_TITLE" \
+              --body-file pr_body.txt \
+              --base main \
+              --head "$BRANCH_NAME")
+            echo "Created PR: $PR_URL"
+          fi
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+          # Request reviews from unique PR authors (best-effort; skip failures)
+          if [ -s reviewers.txt ]; then
+            sort -u reviewers.txt | while read -r reviewer; do
+              gh pr edit "$PR_URL" --add-reviewer "$reviewer" \
+                || echo "Could not add reviewer $reviewer"
+            done
+          fi
