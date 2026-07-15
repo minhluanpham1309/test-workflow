@@ -1,0 +1,151 @@
+name: Terraform Plan on PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - develop
+      - main
+      - feature/*
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_DIR: terraform
+
+jobs:
+  terraform-plan:
+    if: |
+      (startsWith(github.base_ref, 'feature/') && startsWith(github.head_ref, 'feature/')) ||
+      (github.base_ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+      (github.base_ref == 'main' && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false 2>&1
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate -no-color 2>&1
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          PLAN_FILE="plan_output_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.txt"
+          terraform plan -no-color -input=false -out=tfplan
+          terraform show -no-color tfplan > "$PLAN_FILE"
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-pr${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}/${{ steps.plan.outputs.plan_file }}
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Comment PR with Plan Result
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const tfDir = process.env.TF_DIR;
+            const planFile = '${{ steps.plan.outputs.plan_file }}';
+            const planPath = planFile ? path.join(tfDir, planFile) : '';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let planOutput = '';
+            let planStatus = '❌ Failed';
+
+            if (planFile && fs.existsSync(planPath) && fs.statSync(planPath).isFile()) {
+              try {
+                planOutput = fs.readFileSync(planPath, 'utf8');
+                planStatus = '${{ steps.plan.outcome }}' === 'success' ? '✅ Success' : '⚠️ Changes';
+              } catch (err) {
+                console.error('Error reading plan file:', err);
+                planOutput = `Error reading plan file: ${err.message}`;
+              }
+            } else if (!planFile) {
+              planOutput = 'Plan file output not available (likely due to init/validate failure).';
+            } else {
+              planOutput = `Plan file not found at: ${planPath}`;
+            }
+
+            const maxLength = 65000;
+            const isTruncated = planOutput.length > maxLength;
+            const truncatedPlan = isTruncated
+              ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
+              : planOutput;
+
+            const output = `### Terraform Plan Result [${planStatus}]
+
+            <details>
+            <summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${truncatedPlan}
+            \`\`\`
+
+            </details>
+
+            ${isTruncated ? `⚠️ Plan output truncated. View full output in artifacts: ${runUrl}` : ''}
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan Result')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: output,
+              });
+            }
+
+      - name: Terraform Plan Status Check
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "⚠️ Terraform plan failed. Check the PR comment for details."
+          exit 1
