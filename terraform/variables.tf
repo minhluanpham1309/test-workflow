@@ -1,5 +1,5 @@
 variable "aws_region" {
   description = "AWS region dùng để test"
   type        = string
-  default     = "ap-southeast-1"
+  default     = "ap-southeast-2"
 }
